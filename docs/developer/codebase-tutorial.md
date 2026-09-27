@@ -100,6 +100,8 @@ Read the chapters in this order:
 14. [Learning from a teacher with on-policy distillation](#chapter-14-learning-from-a-teacher-with-on-policy-distillation)
 15. [A guided investigation of a real recipe](#chapter-15-a-guided-investigation-of-a-real-recipe)
 
+Reference appendices: [repository map](#appendix-a-repository-map), [checkpoint answers](#appendix-b-checkpoint-answers), [vocabulary](#appendix-c-vocabulary-reference), and [training orchestration and storage](#appendix-d-training-orchestration-and-storage).
+
 **Source edition.** The implementation descriptions and source links refer to revision `23d41d711f3b80544fda655898ed4f051ed644fe`, inspected on September 26, 2026. The [Miles v0.1 announcement](https://www.lmsys.org/blog/2026-08-18-miles-v0-1) motivates the rollout–training–weight-publication loop; this book follows the local implementation of that loop. It focuses on LLM post-training. Diffusion has documentation here but a separate implementation. This is a source-based educational review; GPU training was not executed to produce the book.
 
 ## Part I. Build the mental model
@@ -1886,6 +1888,229 @@ These answers explain the reasoning behind each chapter checkpoint. Try the ques
 | Weight version | An identifier for a published rollout weight update. It is not generally an optimizer-step count. |
 
 
+## Appendix D. Training orchestration and storage
+
+Miles coordinates training through Python async drivers and distributed worker calls. The core learning loop does not use SQL rows to schedule training steps. Its object store transfers experience between processes; the SQL database described below records CI metric history. This appendix separates those responsibilities and documents their data contracts at the book's pinned revision.
+
+### Start by identifying the state and its owner
+
+| State | Owner or storage | Purpose |
+|---|---|---|
+| Current iteration, pending calls, worker health | Driver, controllers, worker processes | Decide what runs next and coordinate completion or recovery. |
+| Completed groups awaiting consumption | Built-in fully async buffer in process memory | Apply capacity limits, filtering, and staleness rules. |
+| Batch payloads and optional critic outputs | Ray object store or Mooncake | Transfer data between rollout and trainer processes. |
+| Model, optimizer, and supported resume state | Backend checkpoints and data-source state files | Preserve training progress across a restart. |
+| Audit events | Per-process JSONL files when configured | Record observations for debugging and analysis. |
+| Historical CI measurements | Neon PostgreSQL; SQLite for offline use and tests | Compare test metrics with trusted historical baselines. |
+
+These stores answer different questions. A completed-group buffer answers “what experience is ready?” A batch reference answers “where can this worker fetch its inputs?” A checkpoint answers “what state can a resumed run restore?” A CI metric row answers “how did this test perform previously?”
+
+### Follow a driver iteration through the workers
+
+The following sequence shows an ordinary successful collection and training iteration. It omits initial weight publication, optional critic training, memory offloading, and periodic checkpoint/evaluation work to keep the main handoffs visible. The publication block summarizes the weight-update protocol; the inference controller also coordinates its start and completion.
+
+```mermaid
+sequenceDiagram
+    participant D as Driver
+    participant R as Rollout executor
+    participant S as Serving engines
+    participant O as Object store
+    participant C as Trainer controller / cells
+    participant W as Trainer workers
+
+    D->>R: get(rollout_id)
+    R->>S: Generate prompt groups
+    S-->>R: Tokens, probabilities, metadata
+    R->>R: Score and convert samples
+    R->>O: put(batch or DP shards)
+    O-->>R: StoreObjectRef(s)
+    R-->>D: RolloutDataPack with references
+    D->>C: train(rollout_id, pack)
+    C->>W: Dispatch train with data references
+    W->>O: get(reference for this DP rank)
+    O-->>W: Retrieved batch data
+    W->>W: Compute scores and advantages
+    loop Each optimizer step in this collection
+        W->>W: Microbatch forward/backward and collectives
+        W->>W: Optimizer update
+    end
+    W->>O: Release retrieved result resources
+    W-->>C: Training outcomes
+    C-->>D: Checked outcomes
+    D->>O: remove(consumed references)
+    opt Weight publication is due
+        D->>C: update_weights(...)
+        C->>W: Convert and transfer parameters
+        W->>S: Updated student weights
+        W-->>C: Published version
+        C-->>D: Published version
+        D->>R: set_weight_version(version)
+    end
+```
+
+The code path is [driver][sync-driver] → [`RolloutExecutor.get()`][executor] → [`TrainerController.train()`][trainer-controller] → [`TrainerCell.train()`][trainer-cell] → the [Megatron][megatron-actor] or [FSDP][fsdp-actor] worker. The controller refreshes its view of trainer cells, gathers outcomes, checks the attempt, and wraps training attempts in retry handling. Numerical synchronization happens inside the backend's distributed computation. Waiting for a worker call and synchronizing gradients are separate operations.
+
+Worker communication is also configurable. The [backend definitions][worker-types] support Ray actor calls or RPC on a Ray deployment, and RPC on Kubernetes. The directory name `miles/ray/` therefore does not imply that every supported deployment communicates exclusively through Ray.
+
+The scheduling modes change when these operations overlap:
+
+| Mode | Driver and behavior |
+|---|---|
+| Synchronous | [`train.py`][sync-driver] awaits collection, trains the collected batch, and publishes weights when another rollout or evaluation needs them. |
+| Pipelined async | [`train_async.py`][async-driver] can start the next collection before awaiting current training. Before a scheduled publication, it awaits pending generation so that this path does not update weights midway through it. |
+| Fully async | The async driver uses [`FullyAsyncRolloutFn`][fully-async], whose background producer continues independently of individual `get()` calls. A drain selects completed groups; when publication is due, the driver defers the next drain until after the version update. |
+
+The built-in [`DefaultDataBuffer`][async-buffer] holds a Python list of completed groups and uses `asyncio.Condition` to coordinate waiting. It enforces capacity and filtering, including a staleness check when consuming groups. It is an in-memory producer/consumer buffer. Custom buffer implementations can choose different storage and policies.
+
+### Count iterations, optimizer steps, and microbatches separately
+
+Change our running example's global batch size from eight to four, while retaining eight trajectories and one sample per trajectory. With two data-parallel ranks and a microbatch size of one sample per rank, the accounting becomes:
+
+```text
+1 driver iteration collects 8 trajectories
+  = 2 optimizer steps, each consuming 4 trajectories globally
+  = 2 microbatches per rank per optimizer step
+
+2 ranks × 2 microbatches × 1 sample = 4 samples per optimizer step
+```
+
+Each rank accumulates gradients across its microbatches before the optimizer update. One later weight-publication event can publish the result of both optimizer steps. Publication versions therefore count a different unit from either driver iterations or optimizer updates.
+
+[`build_dp_schedule()`][dp-schedule] plans optimizer steps using rollout identities. When a trajectory produces multiple training samples, siblings belong to the same step; counting raw sample rows would give the wrong batch size. Depending on backend and recipe support, the schedule is computed during rollout-side conversion or completed on the training side. The [Megatron training loop][megatron-model] iterates over that schedule, and the [FSDP actor][fsdp-actor] has its own optimizer-step loop.
+
+### Understand the reference envelope before the payload
+
+[`RolloutDataPack`][data-transport] is the small message returned to the driver. Its important fields are:
+
+```text
+RolloutDataPack
+  sample_indices: list[int] | None
+  data_ref: StoreObjectRef | list[StoreObjectRef] | None
+
+StoreObjectRef
+  backend: "ray" | "mooncake"
+  payload: backend-specific reference
+```
+
+The [object-store reference models][object-store] use `backend` as their union discriminator. Ray wraps a `ray.ObjectRef`; when serialized through the model, its payload becomes a base64-encoded cloudpickle representation of that reference. Mooncake carries an exported bundle reference, reconstructed by the backend on retrieval. Neither payload is the full batch encoded into this envelope.
+
+The conversion path has two storage arrangements:
+
+| Arrangement | Stored objects | How a trainer obtains its rows |
+|---|---|---|
+| Split before transfer | One object per data-parallel shard; `data_ref` is a list | Select the reference at its data-parallel rank. |
+| `--delay-split-train-data-by-dp` | One object containing the full batch | Fetch the batch and perform the split on the training side. |
+
+See [`split_train_data_by_dp()`][train-conversion] and [`process_rollout_data()`][data-transport]. A shard is assigned to a data-parallel rank; this does not mean a separate object must be created for every tensor- or pipeline-parallel process.
+
+### Read the batch payload schema
+
+The payload is a dictionary of aligned fields. Let `N` be the sample count, `Tᵢ` the full token length of sample `i`, and `Rᵢ` its response length. A “ragged” field contains sequences of different lengths rather than a padded rectangular tensor.
+
+The following table summarizes [`ROLLOUT_DATA_TENSOR_DTYPES` and `ROLLOUT_DATA_VALUE_SPEC`][train-conversion] before trainer-side packing or context-parallel slicing. Fields marked optional depend on the recipe.
+
+| Field | Logical shape | Declared dtype / codec | Meaning |
+|---|---|---|---|
+| `tokens` | N sequences of length Tᵢ | int32 / `typed_ragged` | Prompt and response token IDs. |
+| `response_lengths` | N scalars | int64 / `ndarray` | Response spans within the sequences. |
+| `loss_masks` | N sequences of length Rᵢ | int32 / `typed_ragged` | Response positions contributing to the loss. |
+| `rewards` | N scalars | float32 / `ndarray` | Processed task rewards. |
+| `rollout_log_probs` | N sequences of length Rᵢ, optional | float32 / `typed_ragged` | Recorded generation probabilities. |
+| `teacher_log_probs` | N sequences of length Rᵢ, optional | float32 / `typed_ragged` | Sampled-token OPD teacher scores. |
+| `opd_reverse_kl` | N sequences of length Rᵢ, optional | float32 / `typed_ragged` | Precomputed OPD comparison signal. |
+| `sample_indices`, `rollout_ids` | N identifiers each | int64 / `ndarray` | Sample identity and shared trajectory identity. |
+| `truncated` | N flags | int64 / `ndarray` | Whether generation reached a truncation boundary. |
+| `rollout_mask_sums` | N counts | int64 / `ndarray` | Whole-trajectory mask totals, repeated for sibling samples. |
+| `partition` | One index per shard row | int64 / `ndarray` | That row's original batch index. |
+| `weight_versions` | Structured records per sample, optional | `msgpack_ragged` | Serving-weight provenance. |
+| `multimodal_train_inputs` | Per-sample tensor dictionaries, optional | `ragged_tensor_dict` | Model-specific media inputs. |
+| `raw_reward`, `total_lengths` | Batch reward/length metadata | `auto` | Original reward values and full sequence lengths. |
+| `num_microbatches`, `micro_batch_indices`, `num_rollouts` | Schedule lists, when precomputed | `auto` | Microbatch counts per optimizer step, rank-local microbatch row indices, and global rollout counts per step. |
+
+The dtype column describes declarations, not a universal GPU tensor representation. At this revision, `typed_ragged` specs select the codec without passing the separate dtype-map value into `ValueSpec`; `ndarray` specs explicitly carry a dtype. Ray ignores these codec specs altogether. Trainer preparation also casts values: for example, [training data preparation][training-data] creates token tensors as `torch.long` and slices response probability fields for context parallelism. Inspect the producer, codec, and consumer when exact physical representation matters.
+
+Other declared fields include sampling-mask IDs and offsets, routing/indexer replay data, optional SFT `target_tokens`, witness IDs, and structured prompt/metadata fields. The codec map is not a guarantee that every field exists in every batch or survives every conversion path. `_package_shards()` explicitly selects the fields it carries, including some recipe-specific fields such as adapter slots and custom loss settings.
+
+This invented two-sample excerpt illustrates alignment; it is not a complete batch or a recorded model output:
+
+```json
+{
+  "tokens": [[101, 102, 201, 202], [111, 112, 211]],
+  "response_lengths": [2, 1],
+  "loss_masks": [[1, 1], [1]],
+  "rewards": [0.5, -0.5],
+  "rollout_log_probs": [[-0.3, -0.7], [-0.4]],
+  "sample_indices": [0, 1],
+  "rollout_ids": [0, 1],
+  "truncated": [0, 0]
+}
+```
+
+The first sequence contains two prompt tokens and two response tokens; its mask and response probabilities each have length two. The second contains two prompt tokens and one response token. If these rows are reordered into shards, all per-sample fields must follow the same ordering. Some batch-global fields are carried intact: for example, `process_rollout_data_shard()` later uses `partition` to select the local `total_lengths`, then removes `partition`.
+
+### Separate transport cleanup from checkpoint recovery
+
+The [object-store interface][object-store] consists of `put(value, value_spec)`, `get(reference)`, and `remove(reference)`. A `get()` returns an `ObjectStoreGetResult` whose context manager releases retrieved resources on exit. The [training actors][megatron-actor] enter that context while consuming the batch; after training completes, the driver calls [`remove_rollout_data_refs()`][data-transport] for the stored references. Optional critic-value references have a corresponding cleanup helper.
+
+| Backend | Transfer implementation | Resource lifecycle |
+|---|---|---|
+| Ray | `ray.put()` / `ray.get()`; the wrapper ignores `value_spec` | Retrieved-result release is a no-op in the wrapper. `remove()` explicitly frees objects with RPC worker communication; with Ray worker communication it leaves cleanup to Ray's reference lifecycle. |
+| Mooncake | Structured dictionary bundles, using namespace `miles` and key prefix `miles-object-store` | Retrieved results use `release_result`; removal calls bundle cleanup. `--mooncake-replica-num` controls memory replicas. |
+
+[`--object-store-backend`][arguments] defaults to `ray`. Kubernetes configuration selects Mooncake, and split deployments require it so their components can share the store. Mooncake field schemas are constructed for fields present in the value using their declared codecs.
+
+Stored batch references and in-memory completed groups are not durable training checkpoints. Model and optimizer persistence belongs to the backend checkpoint implementation. The [global data source][data-source] saves supported cursor state such as sample offset, epoch, and sample/group counters. The built-in fully async rollout does not thereby serialize every pending task or buffered result. [Audit events][audit-logger] are written to JSONL when configured; their presence does not turn the driver into a database-backed workflow engine. Chapter 12 explains these recovery boundaries in more detail.
+
+There is also a class named `ObjectStore` in the [worker reconciliation code][reconcile-object-cache]. That class maintains a process-local dictionary of observed objects and their parent keys. It is a controller cache, separate from the Ray/Mooncake batch-transfer abstraction described here.
+
+### Locate the SQL database and its actual purpose
+
+The [CI metric-history adapter][ci-neon-store] uses Neon-hosted PostgreSQL. [`SQLiteMetricHistoryStore`][ci-sqlite-store] supplies the same logical contract for offline use and tests. The CI harness selects the hosted store when `NEON_DATABASE_URL` is set; [without that setting][ci-store-selection], it disables that gate hook rather than automatically creating a local SQLite database. Ordinary RL training does not require this CI database.
+
+The following PostgreSQL DDL reflects the repository's [test provisioning definition][ci-postgres-schema] and the production adapter's expected columns. Production provisioning is managed outside the repository; this book has not inspected the live database. The schema describes CI executions of individual tests, not a queue of model-training jobs.
+
+```sql
+CREATE TABLE IF NOT EXISTS runs (
+    run_id              TEXT PRIMARY KEY,
+    test_path           TEXT NOT NULL,
+    backend             TEXT NOT NULL,
+    suite               TEXT NOT NULL,
+    commit_sha          TEXT NOT NULL,
+    pr_number           INTEGER,
+    github_run_id       BIGINT,
+    github_run_attempt  INTEGER,
+    event_name          TEXT,
+    ref                 TEXT,
+    created_at          TIMESTAMPTZ NOT NULL,
+    trusted             BOOLEAN NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS metric_values (
+    run_id          TEXT NOT NULL REFERENCES runs(run_id),
+    metric_key      TEXT NOT NULL,
+    steps_key       TEXT NOT NULL,
+    constraint_key  TEXT NOT NULL,
+    step            INTEGER NOT NULL,
+    value           DOUBLE PRECISION NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS runs_baseline_idx
+    ON runs (test_path, backend, suite, trusted, created_at DESC);
+
+CREATE INDEX IF NOT EXISTS metric_values_run_id_idx
+    ON metric_values (run_id);
+```
+
+One `runs` row has many `metric_values` rows through `run_id`. The run stores test identity, commit/CI provenance, time, and a run-level trust flag. Each metric row stores one comparison value. The DDL above does not declare a separate metric-row primary key or a uniqueness constraint on its comparison coordinates.
+
+The [storage contract][ci-store-contract] defines `steps_key` and `constraint_key` as canonical JSON encodings of the gate declaration's raw step selection and constraint. The integer `step` identifies the compared point; a whole-series reduction uses `-1`. These coordinates distinguish measurements made under different gate declarations.
+
+The baseline query joins the two tables and matches `(test_path, backend, suite)` plus `(metric_key, steps_key, constraint_key, step)`. It accepts only `trusted` runs, orders by `created_at` descending, and takes a configured limit. Commit SHA is provenance, not part of that baseline identity. The composite run index supports the identity/trust/time lookup; the PostgreSQL fixture's metric index supports lookup by `run_id`.
+
+The SQLite schema uses the same logical columns with SQLite types: `created_at` is text, `trusted` is integer, `value` is real, and `github_run_id` is integer. Its local schema declares the composite baseline index but not the separate metric `run_id` index shown in the PostgreSQL fixture. Neither schema is involved in choosing the next rollout batch or invoking an optimizer step. See the [CI metric-history guide](/developer/ci/03-metric-history-gate) for gate behavior beyond storage.
+
+[Back to contents](#contents-and-progression)
+
 <!-- Source links intentionally pin the inspected revision so this walkthrough remains auditable. -->
 [sync-driver]: https://github.com/radixark/miles/blob/23d41d711f3b80544fda655898ed4f051ed644fe/train.py
 [async-driver]: https://github.com/radixark/miles/blob/23d41d711f3b80544fda655898ed4f051ed644fe/train_async.py
@@ -1959,3 +2184,11 @@ These answers explain the reasoning behind each chapter checkpoint. Try the ques
 [opd-rollout-tests]: https://github.com/radixark/miles/blob/23d41d711f3b80544fda655898ed4f051ed644fe/tests/fast/rollout/test_on_policy_distillation.py
 [opd-loss-tests]: https://github.com/radixark/miles/blob/23d41d711f3b80544fda655898ed4f051ed644fe/tests/fast/backends/training_utils/loss/test_opd.py
 [opd-cp-tests]: https://github.com/radixark/miles/blob/23d41d711f3b80544fda655898ed4f051ed644fe/tests/fast/backends/training_utils/test_opd_cp_data.py
+[data-transport]: https://github.com/radixark/miles/blob/23d41d711f3b80544fda655898ed4f051ed644fe/miles/utils/data.py
+[audit-logger]: https://github.com/radixark/miles/blob/23d41d711f3b80544fda655898ed4f051ed644fe/miles/utils/audit_utils/event_logger/logger.py
+[reconcile-object-cache]: https://github.com/radixark/miles/blob/23d41d711f3b80544fda655898ed4f051ed644fe/miles/utils/workers/reconcile/object_store.py
+[ci-neon-store]: https://github.com/radixark/miles/blob/23d41d711f3b80544fda655898ed4f051ed644fe/tests/ci/metric_history/storage/neon_store.py
+[ci-sqlite-store]: https://github.com/radixark/miles/blob/23d41d711f3b80544fda655898ed4f051ed644fe/tests/ci/metric_history/storage/sqlite_store.py
+[ci-postgres-schema]: https://github.com/radixark/miles/blob/23d41d711f3b80544fda655898ed4f051ed644fe/tests/ci/test/test_neon_store.py
+[ci-store-selection]: https://github.com/radixark/miles/blob/23d41d711f3b80544fda655898ed4f051ed644fe/tests/ci/ci_utils.py
+[ci-store-contract]: https://github.com/radixark/miles/blob/23d41d711f3b80544fda655898ed4f051ed644fe/tests/ci/metric_history/storage/store.py
