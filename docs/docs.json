@@ -290,6 +290,7 @@
      "developer/index",
      "developer/contributor-guide",
      "developer/architecture",
+     "developer/codebase-tutorial",
      "developer/adding-a-sandbox-provider",
      "developer/reconcile-loop",
      "developer/versions",

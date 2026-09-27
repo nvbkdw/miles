@@ -20,6 +20,12 @@ short tour for new contributors.
 
   </Card>
 
+  <Card title="Understanding the Codebase" icon="book-open" href="/developer/codebase-tutorial">
+
+    Follow a prompt through distributed RL, async scheduling, training losses, and weight publication.
+
+  </Card>
+
   <Card title="Versions and Images" icon="layer-group" href="/developer/versions">
 
     How the miles, SGLang and Megatron-LM trees fit together, and how to bump one.
