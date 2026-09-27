@@ -8,6 +8,48 @@ Miles connects a system that **collects experience** to a system that **learns f
 
 You will first learn what the system must accomplish, then follow one small training iteration, then open the implementation behind each stage. Distributed execution and asynchronous scheduling come after the ordinary learning loop is familiar. The final chapters extend that loop to agents, evaluation, custom tasks, and on-policy distillation.
 
+## System architecture at a glance
+
+Follow the solid arrows from prompts to experience, from experience to a student update, and from updated weights back to generation. Dotted arrows show orchestration or optional teacher supervision, as labeled.
+
+```mermaid
+flowchart TB
+    Data["Prompt dataset"]
+    Control["Driver + Ray controllers<br/>Schedule work and manage distributed workers"]
+
+    subgraph Rollout["Collect experience"]
+        Executor["Rollout executor + data source<br/>Build prompt groups and manage trajectories"]
+        Engines["SGLang engines<br/>Generate with the serving copy of the student"]
+        Rewards["Reward hooks<br/>Score answers or environment outcomes"]
+        Completed["Completed prompt groups<br/>Buffered in fully async mode"]
+        Executor --> Engines
+        Engines -->|"Tokens and generation probabilities"| Rewards
+        Rewards --> Completed
+    end
+
+    subgraph Training["Learn from experience"]
+        Batch["Training-data conversion and transport<br/>Tokens, masks, rewards, probabilities, metadata"]
+        Learner["Training actors: Megatron or FSDP<br/>Advantages, loss, distributed gradients, optimizer"]
+        Batch -->|"Batches partitioned across trainer ranks"| Learner
+    end
+
+    Teacher["Optional OPD teacher<br/>Score the student's token choices"]
+    Publish["Weight updater<br/>Convert and transfer updated student parameters"]
+    Observe["Checkpoints and evaluation<br/>Preserve state and measure progress"]
+
+    Data --> Executor
+    Control -.->|"Coordinate rollout"| Executor
+    Control -.->|"Coordinate training"| Learner
+    Completed --> Batch
+    Teacher -.->|"SGLang teacher scores during rollout"| Rewards
+    Teacher -.->|"Megatron teacher forward during training"| Learner
+    Learner --> Publish
+    Publish -->|"Refresh serving weights and publish a version"| Engines
+    Learner -->|"Model state"| Observe
+```
+
+The serving and training copies of the student have different jobs and exchange state through the weight updater. Synchronous execution collects, trains, and publishes in sequence; fully async execution overlaps collection and training through a completed-data buffer. The boxes describe responsibilities, not a fixed GPU layout: placement and parallelism determine which processes and devices perform each job. The two teacher arrows represent alternative OPD scoring modes, covered in Chapter 14.
+
 ## How to read this book
 
 Read the chapters in order on your first pass. Each chapter starts with a learning goal, explains the concept, connects it to Miles, and ends with a short source-reading lab and two questions. The [answer key](#appendix-b-checkpoint-answers) is separate so you can test your understanding before seeing the explanation.
