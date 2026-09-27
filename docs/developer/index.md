@@ -20,9 +20,9 @@ short tour for new contributors.
 
   </Card>
 
-  <Card title="Understanding the Codebase" icon="book-open" href="/developer/codebase-tutorial">
+  <Card title="Miles Codebase Book" icon="book-open" href="/developer/codebase-tutorial">
 
-    Follow a prompt through distributed RL, async scheduling, training losses, and weight publication.
+    Learn sequentially through 14 chapters, from the RL mental model to component internals, with source labs and exercises.
 
   </Card>
 
