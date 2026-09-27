@@ -1,12 +1,12 @@
 ---
 title: Miles, from First Principles to Implementation
 sidebarTitle: Codebase Book
-description: Learn Miles step by step, from the LLM reinforcement learning loop to rollout, distributed training, weight updates, and async execution.
+description: Learn Miles step by step, from the LLM reinforcement learning loop to distributed training, async rollout, and on-policy distillation.
 ---
 
 Miles connects a system that **collects experience** to a system that **learns from that experience**. This book builds that idea into a working understanding of the codebase, one component at a time.
 
-You will first learn what the system must accomplish, then follow one small training iteration, then open the implementation behind each stage. Distributed execution and asynchronous scheduling come after the ordinary learning loop is familiar. The final chapters extend that loop to agents, evaluation, and custom tasks.
+You will first learn what the system must accomplish, then follow one small training iteration, then open the implementation behind each stage. Distributed execution and asynchronous scheduling come after the ordinary learning loop is familiar. The final chapters extend that loop to agents, evaluation, custom tasks, and on-policy distillation.
 
 ## How to read this book
 
@@ -38,7 +38,7 @@ These are invented examples for tracing the program, not recorded outputs or a t
 | I. Build the mental model | 1–3 | Why the loop exists and what crosses each major boundary. |
 | II. Open the core components | 4–7 | How prompts become token data, losses, gradients, and published weights. |
 | III. Distribute and overlap the work | 8–10 | How workers coordinate and how async execution changes data freshness. |
-| IV. Operate and extend the system | 11–14 | How to reason about agents, evaluation, recovery, customization, and debugging. |
+| IV. Operate and extend the system | 11–15 | How to reason about agents, evaluation, recovery, customization, teacher supervision, and debugging. |
 
 Read the chapters in this order:
 
@@ -55,7 +55,8 @@ Read the chapters in this order:
 11. [From answers to tool-using agents](#chapter-11-from-answers-to-tool-using-agents)
 12. [Evaluating and preserving progress](#chapter-12-evaluating-and-preserving-progress)
 13. [Adapting the loop to a new task](#chapter-13-adapting-the-loop-to-a-new-task)
-14. [A guided investigation of a real recipe](#chapter-14-a-guided-investigation-of-a-real-recipe)
+14. [Learning from a teacher with on-policy distillation](#chapter-14-learning-from-a-teacher-with-on-policy-distillation)
+15. [A guided investigation of a real recipe](#chapter-15-a-guided-investigation-of-a-real-recipe)
 
 **Source edition.** The implementation descriptions and source links refer to revision `23d41d711f3b80544fda655898ed4f051ed644fe`, inspected on September 26, 2026. The [Miles v0.1 announcement](https://www.lmsys.org/blog/2026-08-18-miles-v0-1) motivates the rollout–training–weight-publication loop; this book follows the local implementation of that loop. It focuses on LLM post-training. Diffusion has documentation here but a separate implementation. This is a source-based educational review; GPU training was not executed to produce the book.
 
@@ -354,7 +355,7 @@ We have eight completed samples. Before worrying about how they fit on GPUs, est
 
 A reward of one tells us an answer was correct. An advantage compares it with a baseline. In the running example, a correct answer is better than the average attempt at that prompt, while an incorrect one is worse.
 
-Miles can choose different baselines. GRPO uses the other attempts in a prompt group. PPO can use a learned critic that predicts future return. A reference policy has another purpose: it provides an anchor for a KL regularization term. A teacher supplies supervision for distillation, which we will use in Chapter 13. Keep these roles distinct from the policy that generated the data.
+Miles can choose different baselines. GRPO uses the other attempts in a prompt group. PPO can use a learned critic that predicts future return. A reference policy has another purpose: it provides an anchor for a KL regularization term. A teacher supplies supervision for distillation, which we will use in Chapter 14. Keep these roles distinct from the policy that generated the data.
 
 KL means Kullback–Leibler divergence, a measure of how one probability distribution differs from another. In this setting, a reference-KL term can discourage the trained policy from drifting too far from the reference. It is separate from the question of whether a particular math answer was correct.
 
@@ -1251,15 +1252,9 @@ This is why it is useful to understand the full loop before extending it: the re
 
 #### On-policy distillation
 
-The student generates trajectories, and a teacher scores them. The shared advantage code can subtract a distillation signal:
+The student generates trajectories, and a teacher scores its token choices. Miles converts that supervision into an additive adjustment to the selected estimator's advantages. This reuses the rollout, training-data, loss, and weight-publication boundaries already covered in the book.
 
-```text
-A_t <- A_t - opd_kl_coef * (student_old_logp_t - teacher_logp_t)
-```
-
-This is the sampled-token branch. Other paths provide a precomputed reverse-KL estimate. The scalar log-probability difference for one sampled token is an estimator term; it need not itself be nonnegative.
-
-See [rollout-side teacher scoring][opd-rollout] and [`apply_opd_kl_to_advantages()`][opd-loss]. OPD is applied alongside the selected base advantage estimator, so it can coexist with task rewards.
+[Chapter 14](#chapter-14-learning-from-a-teacher-with-on-policy-distillation) follows that signal through the code, including sampled-token and top-k scoring, the two teacher modes, and the difference between pure distillation and distillation combined with task rewards.
 
 #### LoRA and multiple policies
 
@@ -1316,11 +1311,245 @@ Choose one hypothetical change: a different verifier, a new tool environment, or
 
 [Check the answers](#chapter-13-answers) after trying both questions.
 
-You can now locate the component responsible for a proposed change. The last chapter turns that understanding into a repeatable investigation of a real configuration.
+You can now locate the component responsible for a proposed change. Next, we will study a complete extension: using teacher feedback to train on student-generated experience.
 
-**Continue:** [Chapter 14: A guided investigation of a real recipe](#chapter-14-a-guided-investigation-of-a-real-recipe) · **Back:** [Chapter 12: Evaluating and preserving progress](#chapter-12-evaluating-and-preserving-progress)
+**Continue:** [Chapter 14: Learning from a teacher with on-policy distillation](#chapter-14-learning-from-a-teacher-with-on-policy-distillation) · **Back:** [Chapter 12: Evaluating and preserving progress](#chapter-12-evaluating-and-preserving-progress)
 
-### Chapter 14. A guided investigation of a real recipe
+### Chapter 14. Learning from a teacher with on-policy distillation
+
+**Learning goal:** Trace teacher supervision from a student-generated answer to a token advantage, and explain how Miles implements sampled-token, top-k, and distributed OPD.
+
+Return to our two math prompts and four attempts per prompt. So far, a verifier has told us whether each answer is correct. Suppose we also have a teacher whose behavior we want the student to learn. We can ask that teacher to evaluate the student's choices at every response position, giving more detailed feedback than one correctness score per answer.
+
+This chapter follows the implementation at the book's pinned revision. The [OPD announcement](https://www.lmsys.org/blog/2026-07-18-opd-support-in-miles) supplies experimental context; the linked source supplies the contracts and configuration restrictions below. Use the [OPD reference guide](/advanced/on-policy-distillation) when assembling a complete training configuration.
+
+#### Start with who generates the experience
+
+In on-policy distillation, **the student generates the trajectories**. For a prompt `x` and a generated response `y₁, y₂, …`, the teacher evaluates token `yₜ` under the context:
+
+```text
+hₜ = prompt x + student tokens y₁ … yₜ₋₁
+```
+
+The teacher does not first write an alternative answer for the student to imitate. Its feedback describes the choices available along the student's actual path. Even when the student's earlier reasoning is wrong, scoring uses that student's prefix.
+
+This explains the relationship to Chapter 13's SFT adapter. SFT consumes provided target sequences. OPD collects fresh student sequences and attaches teacher supervision to them. The teacher can be a larger model, or a stronger checkpoint from the same model family. “Self-distillation” can therefore involve two distinct checkpoints with the same architecture.
+
+“On-policy” identifies the source of these trajectories; it does not promise that an asynchronous trainer always consumes the newest policy version. The freshness and numerical-alignment concerns from Chapters 9 and 10 still apply.
+
+#### Place the teacher in the loop
+
+Miles has two places where teacher scores can enter:
+
+```mermaid
+flowchart TD
+    P[Prompts] --> S[Student rollout]
+    S --> X[Student tokens and rollout probabilities]
+    X --> H[SGLang teacher scoring during rollout]
+    H --> D[Training data with teacher signal]
+    X --> M[Megatron teacher forward during training]
+    D --> A[Base advantages plus OPD adjustment]
+    M --> A
+    A --> L[Student policy loss and optimizer]
+    L --> W[Publish student weights]
+    W --> S
+```
+
+The two teacher branches are alternatives selected by `--opd-type`. Both feed the shared advantage adjustment. The teacher is a scoring model; the optimizer updates the student, and the normal publication path sends that student's updated weights to rollout workers.
+
+| Teacher mode | Where scoring happens | What crosses into the shared loss path |
+|---|---|---|
+| `sglang`, sampled-token | HTTP scoring while processing rollout rewards | `teacher_log_probs`, one value per response token. |
+| `sglang`, top-k | HTTP scoring plus rollout-side aggregation | `opd_reverse_kl`, one aggregated value per response position. |
+| `megatron` | Teacher checkpoint forward in the training actor | `teacher_log_probs` produced on trainer ranks. |
+
+These paths are implemented in [rollout-side OPD][opd-rollout], the [Megatron actor][megatron-actor], and the [shared OPD advantage helper][opd-loss]. Teacher mode and execution schedule are separate choices; selecting OPD does not automatically provision or schedule an external teacher server.
+
+#### Work through one token before reading the machinery
+
+Let `q` be the fixed student distribution used to score a collected sample, `p` the teacher, and `β` the value of `--opd-kl-coef`. In the sampled-token path, the adjustment is:
+
+```text
+dₜ = log q(yₜ | hₜ) - log p(yₜ | hₜ)
+A_OPD,t = A_base,t - β × dₜ
+```
+
+Here `A_base,t` is the advantage already produced by the selected estimator. The following invented numbers use natural logarithms and `β = 0.5`, before any later advantage normalization:
+
+| Student probability | Teacher probability | Base advantage | Log ratio `dₜ` | Adjusted advantage |
+|---|---|---|---|---|
+| 0.2 | 0.4 | 0 | −0.6931 | +0.3466 |
+| 0.4 | 0.2 | 0 | +0.6931 | −0.3466 |
+| 0.4 | 0.2 | +0.5 | +0.6931 | +0.1534 |
+
+The first token receives a positive signal because the teacher assigns it more probability. The second receives a negative signal. In the third row, positive task feedback and the teacher penalty combine; the net advantage remains positive. Within the policy objective, positive advantage generally favors increasing the sampled token's probability, subject to the clipping, masking, and corrections explained earlier.
+
+The log ratio for one token can be negative. Under an ideal sample `y ~ q`, its expectation over the full token distribution is `KL(q || p)`, which is nonnegative. A sampled term is not itself a full KL divergence. Truncating candidate sets or scoring under a different policy also changes what that estimator represents.
+
+In [`compute_advantages_and_returns()`][loss-dispatch], `q` comes from `rollout_log_probs` when `--use-rollout-logprobs` is enabled, otherwise from the trainer's pre-update `log_probs`. The implementation computes base advantages, calls [`apply_opd_kl_to_advantages()`][opd-loss], and then optionally normalizes the resulting advantages. Normalization can change the scale of the final signal, so the table describes the adjustment at the helper's boundary.
+
+Both old student scores and teacher scores are detached from autograd. The current student forward pass supplies the gradient through the ordinary policy loss. This is an advantage-based distillation implementation: teacher scoring does not create a differentiable graph through the teacher, and the teacher is not optimized by the student update. OPD changes advantages here; it does not separately rewrite the estimator's returned value targets.
+
+#### Follow the sampled-token SGLang path
+
+Start with `--opd-log-prob-top-k 0`, the default. “Sampled-token” means the token actually emitted by the student. With stochastic sampling, that token need not be the highest-probability choice.
+
+The implementation trace is:
+
+1. Student generation fills `Sample.tokens`, `response_length`, and rollout probabilities using the usual rollout machinery.
+2. [`reward_func()`][opd-rollout] chooses a teacher endpoint and sends `sample.tokens` as `input_ids`. Its `_score_payload()` requests log probabilities with `max_new_tokens: 0`: this is scoring an existing sequence, not requesting a teacher completion.
+3. The response contains input-token scores. `_trim_input_field()` removes the server's initial placeholder and keeps the final `response_length` positions. Prompt tokens provide context but do not become response advantages.
+4. `post_process_rewards()` extracts the teacher values into `sample.teacher_log_probs` as float32 tensors. Its returned scalar task rewards are zero; we will revisit that choice shortly.
+5. [`convert_samples_to_train_data()`][train-conversion] includes these per-sample tensors in the training payload. [Training data preparation][training-data] slices them consistently with response log probabilities for context parallelism.
+6. The shared OPD helper checks sample counts and tensor shapes, subtracts the scaled log-ratio vector, and stores `opd_reverse_kl` for logging. The normal student loss and weight-publication paths then run.
+
+For a response of length `R`, the unsliced teacher signal has exactly `R` entries. After context-parallel slicing, the local teacher signal must match the local advantage shape. A scalar sequence reward cannot substitute for this vector. Existing response loss masks still decide which positions contribute to the policy loss; preserving alignment matters for tool messages and other masked context as well as ordinary text.
+
+The HTTP request uses token IDs directly. Teacher and student must agree on tokenization and token-ID meanings. A teacher with a different architecture can be served externally, but this code does not translate between incompatible vocabularies or retokenize prefixes for a second tokenizer.
+
+#### Extend the comparison to top-k candidates
+
+Set `--opd-log-prob-top-k K` above zero to compare selected candidate tokens at each response position. For example, the student may have sampled token 17 while its two most likely candidates were tokens 4 and 9. With `K = 2` and `only-student`, Miles compares the teacher and student scores for 4 and 9 under the same prefix.
+
+Candidate selection is local to each position:
+
+| `--opd-top-k-strategy` | Selected candidates | Additional scoring needed |
+|---|---|---|
+| `only-student` | Student top-k set | Teacher scores student candidates. |
+| `only-teacher` | Teacher top-k set | Student scores teacher candidates. |
+| `intersection` | Candidates shared by both sets | Both top-k tables already contain scores for selected IDs. |
+| `union` | Candidates from either set, without duplicates | Each model scores candidates supplied by the other. |
+| `xor` | Candidates in exactly one set | Each model scores candidates supplied by the other. |
+
+For strategies using student top-k tables, the [legacy SGLang generator][legacy-sglang-rollout] requests `output_top_logprobs` and records them in `sample.metadata["opd_student_top_logprobs"]`. For teacher-origin candidates requiring student scores, the reward hook sends an additional scoring request to the student router. This extra request is distinct from the original generation request.
+
+[`_compute_topk_reverse_kl()`][opd-rollout] aligns token IDs and calculates one number at each response position:
+
+```text
+dₜ = Σ over v in selected_candidatesₜ:
+         weightₜ(v) × [student_logpₜ(v) - teacher_logpₜ(v)]
+```
+
+`--opd-reward-weight-mode` chooses weights derived from student probabilities (`student_p`), teacher probabilities (`teacher_p`), or equal weights (`none`). For all strategies except `xor`, weights are normalized over the selected candidates. For `xor`, the implementation retains unnormalized probabilities, or weight 1 for `none`. An empty selected set contributes zero.
+
+The aggregation uses the original log probabilities in the difference; normalizing the weights does not turn it into an exact KL between two renormalized top-k distributions. Treat it as the configured truncated comparison signal, especially with teacher weighting or `xor`. It can be negative.
+
+The result becomes `sample.opd_reverse_kl`. The trainer subtracts that precomputed vector instead of recomputing sampled-token differences. The top-k candidates are collapsed into a fixed per-position advantage adjustment: the downstream policy loss still trains on the actual sampled response tokens. It does not run a separate dense soft-target cross-entropy over all candidate tokens.
+
+In particular, `K = 1` selects a top candidate, while `K = 0` scores the sampled token. These modes coincide only when their token choices and scoring inputs happen to coincide.
+
+#### Understand why sparse scoring matters
+
+Suppose a four-token response has two candidates per position, and all eight candidate IDs are different. One server interface accepts a single global list of token IDs. Miles can union the eight IDs and ask for every ID at every response position, producing 32 response-position scores even though it needs only eight.
+
+For response length `R`, per-position candidate count `K`, and global union `U`, that response portion scales as `R × |U|`. Since `|U|` can approach `R × K` before reaching the vocabulary limit, it can grow toward `R²K`. Prompt-position scores can add further payload. This is a property of the requested score table, not a statement that the transformer forward computation becomes quadratic in `K`.
+
+With `--opd-topk-per-position`, [`_per_position_ids()`][opd-rollout] constructs empty candidate lists for prompt positions and each response position's own candidate IDs. `_score_payload()` sends this table as `token_ids_logprob_positions`. The requested candidate-score payload then scales with the useful `R × K` entries. The teacher still processes the causal context; this optimization reduces unnecessary score materialization, transfer, and parsing.
+
+At the inspected revision this flag is **off by default** and requires a patched SGLang server supporting that field. If a strategy also asks the student server to score teacher candidates, that scoring server needs support too. Sparse scoring is therefore a Miles/server protocol capability that must be enabled together, not an automatic consequence of setting top-k.
+
+#### Choose a teacher configuration
+
+The following are configuration fragments to add to a compatible launcher, not complete runnable jobs. GPU allocation, model paths, data, evaluation, and normal training settings are still required.
+
+For sampled-token scoring through an already running SGLang teacher:
+
+```text
+--use-opd
+--opd-type sglang
+--opd-kl-coef 1.0
+--opd-log-prob-top-k 0
+--custom-rm-path miles.rollout.on_policy_distillation.reward_func
+--custom-reward-post-process-path miles.rollout.on_policy_distillation.post_process_rewards
+--rm-url http://teacher-host:30000/generate
+```
+
+The endpoint is SGLang's scoring-capable `/generate` API. The two custom hooks obtain the structured teacher response and convert it into training fields; enabling `--use-opd` alone does not install these hooks or start the server.
+
+For student-top-k scoring, replace the top-k setting and add:
+
+```text
+--opd-log-prob-top-k 16
+--opd-top-k-strategy only-student
+--opd-reward-weight-mode student_p
+```
+
+At this revision, [argument validation][arguments] requires `MILES_USE_LEGACY_ROLLOUT_V1=1` for top-k strategies other than `only-teacher`, because only that rollout path records the required student top-k metadata. Set it in the job environment so the relevant processes receive it. The fully async path requires class-based rollout, so do not combine it with this legacy-only student-top-k recipe. These are implementation restrictions, separate from whether OPD is conceptually compatible with asynchronous learning. Add `--opd-topk-per-position` only after confirming server support.
+
+For an in-process Megatron teacher, use a compatible same-architecture teacher checkpoint:
+
+```text
+--use-opd
+--opd-type megatron
+--opd-kl-coef 1.0
+--opd-teacher-load /checkpoints/teacher
+```
+
+The [Megatron actor][megatron-actor] loads and backs up a `teacher` weight set. Before computing advantages, it switches the model to that weight set, computes scores with `store_prefix="teacher_"`, and switches back to the student for its update. This reuses the configured model structure through weight switching; it should not be pictured as an independently optimized teacher training job. `--opd-teacher-ckpt-step` can select a teacher checkpoint step separately.
+
+This path requires a compatible Megatron checkpoint and model architecture. It does not use the SGLang OPD reward hooks to obtain teacher probabilities. Choose the task reward separately. Top-k OPD is currently restricted to `sglang` by validation; the embedded teacher-forward path described here is implemented in the Megatron backend, not a general promise for every training backend.
+
+The [OPD example directory][opd-examples] contains SGLang, Megatron, and multi-teacher launchers. Read them together with the current validation rules above when adapting their environment and hardware settings.
+
+#### Separate pure distillation from task-reward mixing
+
+In our running GRPO example, setting all task rewards to zero makes the task-derived group advantages zero. With other reward and regularization terms disabled, the OPD adjustment supplies the learning signal. The four attempts still matter as collected student experience even though correctness no longer distinguishes their task rewards.
+
+The standard SGLang `post_process_rewards()` deliberately returns two zero-filled scalar lists after extracting teacher supervision. Consequently, installing those standard hooks selects pure distillation at the task-reward boundary. It does not automatically retain a math reward computed elsewhere.
+
+To combine task feedback with SGLang OPD, a custom reward/post-processing implementation must retain the teacher payload, populate `teacher_log_probs` or `opd_reverse_kl`, and return the intended raw and processed **task** rewards. In [`_post_process_rewards()`][train-conversion], a custom postprocessor replaces default processing. It must therefore also implement the group centering or other reward transformation required by the chosen recipe; merely returning unprocessed correctness scores can change the GRPO behavior learned in Chapter 5.
+
+With a Megatron teacher, teacher scores arrive in the actor independently of rollout reward scoring. The ordinary task reward can feed the base estimator, after which the same OPD adjustment is added. A reference-policy KL term is another separate choice: reference regularization anchors the policy, while OPD supplies supervision from a teacher. Their coefficients and model roles are distinct.
+
+Keep training and evaluation rewards separate when measuring pure OPD. The [self-distillation example's reward functions][opd-selfdistill-rewards] return zero for pure-OPD training samples but calculate correctness for evaluation samples tagged through metadata. Zero training reward is expected in that setup; held-out accuracy remains meaningful. Track that accuracy, response length, and the teacher-comparison metric together rather than interpreting teacher agreement alone as task success.
+
+#### Route different tasks to different teachers
+
+The SGLang hook can choose one teacher per sample. For example, a dataset row may carry:
+
+```json
+{"prompt": "Solve this equation...", "metadata": {"opd_teacher": "math"}}
+```
+
+Configure a routing map with:
+
+```text
+--opd-teacher-urls math=http://math-host:30000/generate code=http://code-host:30000/generate default=http://math-host:30000/generate
+--opd-teacher-key opd_teacher
+```
+
+[`_teacher_url_for_sample()`][opd-rollout] looks up that metadata value. A missing or unknown name uses `default` when provided and otherwise raises an error. Without a routing map, it uses `--rm-url`. The student receives one selected teacher's signal for each sample; this is routing across specialists, not averaging an ensemble's scores for every token. All endpoints must share the student's token-ID semantics. The downstream training tensors and advantage helper remain the same.
+
+#### Connect implementation to the reported experiment
+
+The [July 2026 OPD post](https://www.lmsys.org/blog/2026-07-18-opd-support-in-miles) reports Qwen3.5-35B-A3B self-distillation on eight B200 GPUs using zero task reward and a top-1 teacher signal. Held-out DAPO increased from 0.8457 to 0.8945; sampled rollout length fell from roughly 18.6k tokens to mostly 5.5k–6.7k. The post presents this as controlled pure-OPD validation and leaves broader RL-augmented and multi-teacher validation for future work.
+
+Those are reported experimental results, not measurements from this book. The repository's [related self-distillation recipes][opd-selfdistill] include different hardware and teacher-scoring configurations. Use them to study the sequence of training a teacher, selecting its checkpoint, restarting a base student, and measuring transfer; do not assume each launcher reproduces the post's exact experiment.
+
+#### Source lab
+
+Follow one response through these boundaries, writing the tensor shape or payload field at each step:
+
+1. In [`reward_func()` and `_score_payload()`][opd-rollout], find the zero-generation scoring request and the teacher endpoint selection.
+2. In the same module, follow `post_process_rewards()` twice: once for `K = 0`, then for `K > 0`. Record which `Sample` field is populated and what happens to scalar task rewards.
+3. Follow those fields through [sample conversion][train-conversion] and [context-parallel data preparation][training-data]. Explain why prompt length and response length cannot be interchanged.
+4. Read [the OPD advantage helper][opd-loss] and its caller in [shared loss dispatch][loss-dispatch]. Locate detach operations, shape checks, and the later optional normalization.
+5. Read the [rollout OPD tests][opd-rollout-tests] for candidate selection and sparse-position alignment, the [loss tests][opd-loss-tests] for sign and gradient boundaries, and the [context-parallel tests][opd-cp-tests] for response slicing. Predict an assertion before reading its expected value.
+
+As a final extension, inspect the Megatron actor's `teacher` weight switch. Identify precisely which earlier HTTP/data-conversion steps it replaces and which shared training steps it retains.
+
+#### Check your understanding
+
+1. With zero base advantage, student probability 0.2, teacher probability 0.4, and `β = 0.5`, what is the adjusted sampled-token advantage? Which model receives gradients, and does zero scalar task reward imply no learning?
+2. Are `--opd-log-prob-top-k 0` and `1` equivalent? What additional runtime requirements apply to `K = 16`, `only-student`, and sparse per-position scoring at this revision?
+
+[Check the answers](#chapter-14-answers) after trying both questions.
+
+You have now traced a new learning signal through the same collection, transport, parallel training, and publication boundaries. The final chapter applies that method to investigating a complete recipe.
+
+**Continue:** [Chapter 15: A guided investigation of a real recipe](#chapter-15-a-guided-investigation-of-a-real-recipe) · **Back:** [Chapter 13: Adapting the loop to a new task](#chapter-13-adapting-the-loop-to-a-new-task)
+
+### Chapter 15. A guided investigation of a real recipe
 
 **Learning goal:** Read a launch configuration, predict its behavior, and use source and observations to explain a run.
 
@@ -1423,11 +1652,11 @@ Complete the six-item prediction sheet for the [small FSDP recipe][fsdp-recipe].
 1. A completed buffer stays near capacity. Which side of the producer–consumer relationship is slower at that observation point?
 2. What should you inspect before interpreting a decreasing training loss as improved task performance?
 
-[Check the answers](#chapter-14-answers) after trying both questions.
+[Check the answers](#chapter-15-answers) after trying both questions.
 
 You have followed the same loop from its learning purpose to its implementation and operational behavior. Use the appendices as a map and answer key when you return to a component.
 
-**Continue:** [Repository map](#appendix-a-repository-map) · **Back:** [Chapter 13: Adapting the loop to a new task](#chapter-13-adapting-the-loop-to-a-new-task)
+**Continue:** [Repository map](#appendix-a-repository-map) · **Back:** [Chapter 14: Learning from a teacher with on-policy distillation](#chapter-14-learning-from-a-teacher-with-on-policy-distillation)
 
 ## Appendix A. Repository map
 
@@ -1583,10 +1812,17 @@ These answers explain the reasoning behind each chapter checkpoint. Try the ques
 
 ### Chapter 14 answers
 
+1. The log ratio is `ln(0.2 / 0.4) ≈ −0.6931`, so the adjusted advantage is about `+0.3466` before optional normalization. The current student receives gradients through the policy loss; teacher and old student scores are fixed inputs. Zero task rewards can still produce learning from the OPD adjustment.
+2. No. Zero selects the actually sampled token; one selects a top candidate, which may differ. Student-top-k scoring requires the legacy rollout environment setting at this revision and cannot use the built-in fully async class-based path. Sparse scoring additionally requires `--opd-topk-per-position` and compatible scoring servers. Top-k teacher scoring uses `--opd-type sglang`.
+
+[Return to Chapter 14](#chapter-14-learning-from-a-teacher-with-on-policy-distillation)
+
+### Chapter 15 answers
+
 1. Consumption is not keeping up with accepted production, possibly because training, publication, or other driver work limits it. Use timing to identify the particular bottleneck.
 2. Actual responses, labels, reward correctness, masks, and held-out evaluation, then the objective’s advantages and probability/provenance assumptions.
 
-[Return to Chapter 14](#chapter-14-a-guided-investigation-of-a-real-recipe)
+[Return to Chapter 15](#chapter-15-a-guided-investigation-of-a-real-recipe)
 
 ## Appendix C. Vocabulary reference
 
@@ -1599,6 +1835,9 @@ These answers explain the reasoning behind each chapter checkpoint. Try the ques
 | Advantage | A training signal describing how favorable an action or trajectory was relative to a baseline. |
 | Critic | An optional learned value model used by PPO. GRPO does not require this model. |
 | Reference model | A separate policy used for KL regularization. It is not the critic or the behavior policy. |
+| Teacher | A scoring model that supplies token-level supervision for distillation. It is separate from the student optimizer. |
+| On-policy distillation (OPD) | Learning from teacher scores on student-generated trajectories; Miles applies the signal to token advantages. |
+| Top-k OPD | A per-position comparison of selected student/teacher candidate tokens, aggregated into a fixed advantage adjustment. |
 | Behavior policy | The policy distribution that actually generated a token. With async rollout, it may be older than the trainer. |
 | Rank | One process participating in distributed tensor computation. |
 | Engine | A serving instance, potentially spanning several GPU ranks. |
@@ -1671,3 +1910,10 @@ These answers explain the reasoning behind each chapter checkpoint. Try the ques
 [weight-tests]: https://github.com/radixark/miles/tree/23d41d711f3b80544fda655898ed4f051ed644fe/tests/fast/backends/training_utils/weight_update
 [fsdp-recipe]: https://github.com/radixark/miles/blob/23d41d711f3b80544fda655898ed4f051ed644fe/scripts/run_qwen3_0_6b_fsdp.py
 [async-recipe]: https://github.com/radixark/miles/blob/23d41d711f3b80544fda655898ed4f051ed644fe/examples/infra_features/fully_async/run_qwen3_30b_a3b_fully_async.py
+[legacy-sglang-rollout]: https://github.com/radixark/miles/blob/23d41d711f3b80544fda655898ed4f051ed644fe/miles/rollout/sglang_rollout.py
+[opd-examples]: https://github.com/radixark/miles/tree/23d41d711f3b80544fda655898ed4f051ed644fe/examples/on_policy_distillation
+[opd-selfdistill]: https://github.com/radixark/miles/blob/23d41d711f3b80544fda655898ed4f051ed644fe/examples/on_policy_distillation/qwen3_5_35b_selfdistill/README.md
+[opd-selfdistill-rewards]: https://github.com/radixark/miles/blob/23d41d711f3b80544fda655898ed4f051ed644fe/examples/on_policy_distillation/qwen3_5_35b_selfdistill/rm.py
+[opd-rollout-tests]: https://github.com/radixark/miles/blob/23d41d711f3b80544fda655898ed4f051ed644fe/tests/fast/rollout/test_on_policy_distillation.py
+[opd-loss-tests]: https://github.com/radixark/miles/blob/23d41d711f3b80544fda655898ed4f051ed644fe/tests/fast/backends/training_utils/loss/test_opd.py
+[opd-cp-tests]: https://github.com/radixark/miles/blob/23d41d711f3b80544fda655898ed4f051ed644fe/tests/fast/backends/training_utils/test_opd_cp_data.py

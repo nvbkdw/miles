@@ -22,7 +22,7 @@ short tour for new contributors.
 
   <Card title="Miles Codebase Book" icon="book-open" href="/developer/codebase-tutorial">
 
-    Learn sequentially through 14 chapters, from the RL mental model to component internals, with source labs and exercises.
+    Learn sequentially through 15 chapters, from the RL mental model to component internals, with source labs and exercises.
 
   </Card>
 
